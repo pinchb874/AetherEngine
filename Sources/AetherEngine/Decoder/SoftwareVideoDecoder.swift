@@ -167,6 +167,28 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// from one that is not.
     private var loggedSendFailure = false
 
+    /// True once this decoder opened on libavcodec's VideoToolbox hwaccel.
+    private(set) var usingVideoToolbox = false
+
+    /// Opt-in (`-ae.vtH264 YES`): progressive H.264 only. `field_order` unknown is not progressive
+    /// enough: a 1080i broadcast stream is exactly the one VideoToolbox cannot decode.
+    static func wantsVideoToolbox(codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
+        guard UserDefaults.standard.bool(forKey: "ae.vtH264") else { return false }
+        return codecpar.pointee.codec_id == AV_CODEC_ID_H264
+            && codecpar.pointee.field_order == AV_FIELD_PROGRESSIVE
+    }
+
+    private static func attachVideoToolbox(to ctx: UnsafeMutablePointer<AVCodecContext>) -> Bool {
+        var device: UnsafeMutablePointer<AVBufferRef>?
+        let ret = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, nil, nil, 0)
+        guard ret >= 0, let device else {
+            EngineLog.emit("[SWDecoder] videotoolbox device failed ret=\(ret); software decode", category: .swPlayback)
+            return false
+        }
+        ctx.pointee.hw_device_ctx = device
+        return true
+    }
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
         deinterlacer.config = deinterlaceConfig
@@ -202,6 +224,33 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
             throw VideoDecoderError.noCodecParameters
+        }
+
+        // Progressive H.264 decoded by VideoToolbox through libavcodec's hwaccel, so a live
+        // stream keeps hardware decode AND this host's direct presentation (no loopback HLS, no
+        // AVPlayer hold-back). libavcodec parses the Annex B stream and its inline parameter sets
+        // itself; `handleFrame` already copies AV_PIX_FMT_VIDEOTOOLBOX frames into our own pool.
+        // Interlaced streams stay on pure software: the deinterlace graph uploads software frames.
+        if Self.wantsVideoToolbox(codecpar: codecpar), Self.attachVideoToolbox(to: ctx) {
+            usingVideoToolbox = true
+            ctx.pointee.get_format = { _, fmts in
+                guard let fmts = fmts else { return AV_PIX_FMT_NONE }
+                var i = 0
+                while fmts[i] != AV_PIX_FMT_NONE {
+                    if fmts[i] == AV_PIX_FMT_VIDEOTOOLBOX { return fmts[i] }
+                    i += 1
+                }
+                return fmts[0]
+            }
+            ctx.pointee.thread_count = 1
+            guard avcodec_open2(ctx, codec, nil) >= 0 else {
+                throw VideoDecoderError.sessionCreationFailed(status: -2)
+            }
+            containerColor = ColorDescription(codecpar: codecpar)
+            use10Bit = codecpar.pointee.bits_per_raw_sample > 8
+                || ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
+            EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), hwaccel=videotoolbox", category: .swPlayback)
+            return
         }
 
         // Reject VideoToolbox pixel format to force pure software decode (some decoders ignore this).
