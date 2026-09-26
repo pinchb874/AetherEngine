@@ -161,7 +161,9 @@ final class AudioOutput: @unchecked Sendable {
     /// past the caller's `lastEnqueuedAudioPtsSec` bookkeeping (whose lead is measured against the
     /// synchronizer clock, i.e. against the source axis too). Only the renderer sees the shift.
     func enqueue(sampleBuffer: CMSampleBuffer) {
-        renderer.enqueue(retimed(sampleBuffer))
+        let out = retimed(sampleBuffer)
+        noteLateness(of: out)
+        renderer.enqueue(out)
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -180,6 +182,33 @@ final class AudioOutput: @unchecked Sendable {
             EngineLog.emit("[AudioOutput] renderer error: \(err)", category: .swPlayback)
         }
         #endif
+    }
+
+    /// Audio handed over after its own presentation time, which the renderer drops without a
+    /// word — silence the engine's rebuffer flag never sees, because the pump's lead is measured on the
+    /// source axis, before any lip-sync offset moves the samples. Counted while the clock runs and
+    /// reported at most once a second as `LATE-AUDIO`, so a dropout a viewer hears has a number.
+    private var lateBuffers = 0
+    private var worstLateness = 0.0
+    private var lastLateReport = DispatchTime(uptimeNanoseconds: 0)
+
+    private func noteLateness(of buffer: CMSampleBuffer) {
+        guard synchronizer.rate > 0 else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
+        let clock = currentTimeSeconds
+        guard pts.isFinite, pts < clock else { return }
+        lateBuffers += 1
+        worstLateness = max(worstLateness, clock - pts)
+        let now = DispatchTime.now()
+        guard now.uptimeNanoseconds - lastLateReport.uptimeNanoseconds > 1_000_000_000 else { return }
+        EngineLog.emit(
+            "[AudioOutput] LATE-AUDIO \(lateBuffers) buffers, worst "
+            + String(format: "%.0f ms behind the clock", worstLateness * 1000),
+            category: .swPlayback
+        )
+        lastLateReport = now
+        lateBuffers = 0
+        worstLateness = 0
     }
 
     #if DEBUG
