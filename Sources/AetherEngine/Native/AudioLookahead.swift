@@ -12,7 +12,8 @@ enum AudioLookaheadPolicy {
     /// Decoded-audio lead the pump maintains over the synchronizer clock. Bounds renderer
     /// memory (~1.5 MB PCM at 4 s stereo Float32 48 kHz) while surviving multi-second
     /// feeder stalls.
-    static let targetLeadSeconds = 4.0
+    /// `-ae.pumpTarget S` overrides, for measuring live latency against dropouts.
+    static var targetLeadSeconds: Double { let v = UserDefaults.standard.double(forKey: "ae.pumpTarget"); return v > 0 ? v : 4.0 }
 
     /// Pre-arm packet budget per pump pass: enough to coax first buffers out of a
     /// delay-heavy decoder so the clock can arm, without racing through the whole ring
@@ -30,7 +31,9 @@ enum AudioLookaheadPolicy {
     /// chopping that never recovers). Pause the clock and rebuffer instead, exactly like the
     /// native path's AVPlayer stall handling.
     static let underrunPauseLeadSeconds = 0.15
-    static let rebufferResumeLeadSeconds = 2.0
+    /// `-ae.resumeLead S` overrides. On a live source this is where the clock sits behind the
+    /// newest byte after any underrun, for good, so it is most of the software path's latency.
+    static var rebufferResumeLeadSeconds: Double { let v = UserDefaults.standard.double(forKey: "ae.resumeLead"); return v > 0 ? v : 2.0 }
 
     enum ClockAction: Equatable {
         case none
