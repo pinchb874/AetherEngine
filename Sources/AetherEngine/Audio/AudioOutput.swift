@@ -208,6 +208,7 @@ final class AudioOutput: @unchecked Sendable {
         #endif
         lock.unlock()
         if let offsetLine { EngineLog.emit(offsetLine, category: .swPlayback) }
+        noteLateness(of: delivered)
 
         #if DEBUG
         // Once per session: first enqueue + any renderer rejection, to distinguish "nothing enqueued" from
@@ -227,6 +228,33 @@ final class AudioOutput: @unchecked Sendable {
         }
         #endif
         return true
+    }
+
+    /// Audio handed over after its own presentation time, which the renderer drops without a
+    /// word — silence the engine's rebuffer flag never sees, because the pump's lead is measured on the
+    /// source axis, before any lip-sync offset moves the samples. Counted while the clock runs and
+    /// reported at most once a second as `LATE-AUDIO`, so a dropout a viewer hears has a number.
+    private var lateBuffers = 0
+    private var worstLateness = 0.0
+    private var lastLateReport = DispatchTime(uptimeNanoseconds: 0)
+
+    private func noteLateness(of buffer: CMSampleBuffer) {
+        guard synchronizer.rate > 0 else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
+        let clock = currentTimeSeconds
+        guard pts.isFinite, pts < clock else { return }
+        lateBuffers += 1
+        worstLateness = max(worstLateness, clock - pts)
+        let now = DispatchTime.now()
+        guard now.uptimeNanoseconds - lastLateReport.uptimeNanoseconds > 1_000_000_000 else { return }
+        EngineLog.emit(
+            "[AudioOutput] LATE-AUDIO \(lateBuffers) buffers, worst "
+            + String(format: "%.0f ms behind the clock", worstLateness * 1000),
+            category: .swPlayback
+        )
+        lastLateReport = now
+        lateBuffers = 0
+        worstLateness = 0
     }
 
     #if DEBUG

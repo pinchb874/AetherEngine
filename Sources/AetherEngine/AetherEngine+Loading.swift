@@ -1854,8 +1854,13 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] activateRendererAudioSession error: \(error)", category: .engine)
         }
         let maxCh = session.maximumOutputNumberOfChannels
-        let prefCh = min(sourceChannels ?? maxCh, maxCh)
-        try? session.setPreferredOutputNumberOfChannels(prefCh)
+        // An unknown channel count leaves the link as it is. Asking for the maximum when a live
+        // probe had not yet seen the audio's parameters took a stereo channel to six channels, and the
+        // HDMI renegotiation that follows is an audible dropout that also moved the reported output
+        // latency from 80 to 144 ms.
+        if let sourceChannels {
+            try? session.setPreferredOutputNumberOfChannels(min(sourceChannels, maxCh))
+        }
         EngineLog.emit("[AetherEngine] renderer audio session active: sourceCh=\(sourceChannels?.formatted() ?? "unknown") maxChannels=\(maxCh) preferred=\(session.preferredOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
     }
     #endif
