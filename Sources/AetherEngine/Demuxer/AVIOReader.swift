@@ -480,6 +480,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// reconnects and seek reconnects stay open-ended. nil = open-ended everywhere (playback).
     private let boundedInitialFetch: Int64?
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
+    /// How long a live read waits for a full request before handing over a partial one.
+    static let liveShortReadAfterMs: Double = 500
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
     // Backpressure: suspend the streaming task above highWater, resume below lowWater.
     private static let streamHighWaterDefault = 64 * 1024 * 1024
@@ -2001,6 +2003,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #281 retest: fixed once per read, so a loop that wakes repeatedly cannot keep extending
         // its own patience for the speculative fetch.
         var tailWaitDeadline: Date?
+        // When this read first received bytes, for the live short read below.
+        var firstCopyAt: DispatchTime?
         func msSince(_ t: DispatchTime) -> Double {
             Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000
         }
@@ -2264,6 +2268,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 window.copyBytes(to: buf.advanced(by: totalRead), from: posInWindow, count: copyNow)
                 position = curPosition + Int64(copyNow)
                 totalRead += copyNow
+                // Live: once a read has waited `liveShortReadAfterMs` past its first byte, what has arrived is handed over
+                // rather than held until the request is full. A live source is produced in real time,
+                // so filling a 256 KB request can mean waiting for bytes that do not exist yet: on a
+                // sparse stream (a still slate at ~130 kbit/s) the probe sat ~15 s on data that had
+                // arrived in the first 6, and every later read ran the same 15 s behind. Not at once:
+                // a full first read is what the probe has always seen, and a broadcast mux whose first
+                // audio sits past the probe budget was only described because that read went deeper.
+                // A normal-rate channel fills the request inside the wait and behaves as before. Timed
+                // from the first byte, not the call: an origin that holds its response (2 s on a cold
+                // tune) would otherwise cut the first read at its first packet.
+                if firstCopyAt == nil { firstCopyAt = DispatchTime.now() }
+                let liveShortRead = isLive && copyNow == available && totalRead < requestSize
+                    && firstCopyAt.map { msSince($0) >= Self.liveShortReadAfterMs } == true
                 trimWindowLocked()
                 // "Real progress" is the CURRENT generation having delivered — draining read-ahead
                 // is not. An unguarded reset here ran in the same iteration as the faulted-refill
@@ -2319,6 +2336,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         timedReconnect(seek: false, at: refillFrom)
                     }
                 }
+                if liveShortRead { return Int32(totalRead) }
                 continue
             }
 
